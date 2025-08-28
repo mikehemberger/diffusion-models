@@ -1,4 +1,3 @@
-```python
 import math
 import os
 from typing import Optional, Tuple
@@ -15,10 +14,22 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
+"""CIFAR-10 Class-Conditional DDPM (Minimal).
+
+This script is the source of truth for the notebook; it contains concise
+docstrings and inline comments that explain the diffusion model and training.
+Extended explanations live in README.md.
+"""
+
 # Diffusion schedule and precomputations
 T = 1000
 
 def linear_beta_schedule(timesteps: int, beta_start: float = 1e-4, beta_end: float = 0.02):
+    """Create a linear noise schedule beta_t over discrete timesteps.
+
+    beta_t controls how much Gaussian noise is added at each forward step
+    q(x_t | x_{t-1}). Starting small and ending larger increases noise over time.
+    """
     return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32, device=DEVICE)
 
 betas = linear_beta_schedule(T)
@@ -34,6 +45,15 @@ posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_c
 posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
 
 def extract(a: torch.Tensor, t: torch.LongTensor, shape: Tuple[int, ...]):
+    """Gather t-indexed coefficients for each batch item and reshape to broadcast.
+
+    Args:
+        a: 1D tensor of length T with per-timestep coefficients.
+        t: Long tensor [B] of timesteps per batch item.
+        shape: Target broadcast shape (e.g., [B, C, H, W]).
+    Returns:
+        Tensor broadcastable to `shape`.
+    """
     out = a.gather(-1, t)
     while len(out.shape) < len(shape):
         out = out.unsqueeze(-1)
@@ -41,6 +61,7 @@ def extract(a: torch.Tensor, t: torch.LongTensor, shape: Tuple[int, ...]):
 
 # Model: small class-conditional UNet for 32x32
 class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal timestep embedding for integer t in [0, T)."""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -55,6 +76,7 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 class ResidualBlock(nn.Module):
+    """Residual block with additive conditioning from time/class embeddings."""
     def __init__(self, in_ch: int, out_ch: int, cond_dim: int):
         super().__init__()
         self.norm1 = nn.GroupNorm(8, in_ch)
@@ -65,12 +87,19 @@ class ResidualBlock(nn.Module):
         self.cond = nn.Linear(cond_dim, out_ch)
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
     def forward(self, x: torch.Tensor, cond: torch.Tensor):
+        """Apply conditioned residual block.
+
+        Args:
+            x: Input feature map [B, C, H, W].
+            cond: Conditioning vector [B, cond_dim] (time + class).
+        """
         h = self.conv1(self.act(self.norm1(x)))
         h = h + self.cond(cond).unsqueeze(-1).unsqueeze(-1)
         h = self.conv2(self.act(self.norm2(h)))
         return h + self.skip(x)
 
 class Down(nn.Module):
+    """Downsampling by strided conv (H,W -> H/2, W/2)."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.op = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
@@ -78,6 +107,7 @@ class Down(nn.Module):
         return self.op(x)
 
 class Up(nn.Module):
+    """Nearest-neighbor upsample followed by a 3x3 conv (H,W -> 2H, 2W)."""
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
@@ -86,6 +116,7 @@ class Up(nn.Module):
         return self.conv(self.up(x))
 
 class UNet32(nn.Module):
+    """Compact UNet predicting noise ε_θ(x_t, t, y) for 32x32 images."""
     def __init__(self, in_channels: int = 3, base_channels: int = 64, class_embed_num: int = 11):
         super().__init__()
         ch1, ch2, ch3 = base_channels, base_channels * 2, base_channels * 2
@@ -117,6 +148,7 @@ class UNet32(nn.Module):
         self.out_conv = nn.Conv2d(ch1, in_channels, 3, padding=1)
 
     def forward(self, x: torch.Tensor, t: torch.LongTensor, y: torch.LongTensor):
+        """Predict per-pixel noise ε given noised x_t, timestep t, and label y."""
         temb = self.time_mlp(t)
         cemb = self.class_emb(y)
         cond = temb + cemb
@@ -141,12 +173,14 @@ class UNet32(nn.Module):
 
 # Diffusion utilities
 def q_sample(x0: torch.Tensor, t: torch.LongTensor, noise: Optional[torch.Tensor] = None):
+    """Sample q(x_t | x_0) in closed form: x_t = sqrt(ᾱ_t) x_0 + sqrt(1-ᾱ_t) ε."""
     if noise is None:
         noise = torch.randn_like(x0)
     return extract(sqrt_alphas_cumprod, t, x0.shape) * x0 + extract(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
 
 @torch.no_grad()
 def p_mean_variance(model: nn.Module, x_t: torch.Tensor, t: torch.LongTensor, y: torch.LongTensor, guidance_scale: float = 0.0):
+    """Compute mean/log-var for p_θ(x_{t-1} | x_t) using ε-prediction and guidance."""
     null_y = torch.full_like(y, 10)
     eps_cond = model(x_t, t, y)
     if guidance_scale > 0:
@@ -162,6 +196,7 @@ def p_mean_variance(model: nn.Module, x_t: torch.Tensor, t: torch.LongTensor, y:
 
 @torch.no_grad()
 def p_sample(model: nn.Module, x_t: torch.Tensor, t: torch.LongTensor, y: torch.LongTensor, guidance_scale: float = 0.0):
+    """One reverse step: sample x_{t-1} given x_t (deterministic if t==0)."""
     mean, log_var = p_mean_variance(model, x_t, t, y, guidance_scale)
     if (t == 0).all():
         return mean
@@ -170,6 +205,7 @@ def p_sample(model: nn.Module, x_t: torch.Tensor, t: torch.LongTensor, y: torch.
 
 @torch.no_grad()
 def p_sample_loop(model: nn.Module, shape: Tuple[int, int, int, int], steps: int, labels: torch.LongTensor, guidance_scale: float = 0.0):
+    """Run the full reverse process from Gaussian noise to images."""
     b = shape[0]
     x = torch.randn(shape, device=DEVICE)
     steps = int(steps)
